@@ -1,8 +1,12 @@
 """Versioned configuration consumed by service instances through one active pointer."""
 from contextlib import closing
+import errno
 import json
+import os
 import re
+import secrets
 import sqlite3
+import tempfile
 
 
 class ConflictingPromotion(Exception):
@@ -10,6 +14,7 @@ class ConflictingPromotion(Exception):
 
 
 _IDENT_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+_BRANCH_RE = re.compile(r"[0-9a-f]{32}\Z")  # library branch identifiers
 _MAX_ID = (1 << 63) - 1      # revision, pin and cursor ids are positive 63-bit integers
 _BATCH_MAX = 32              # retire/pin batches accept at most this many ids
 _SCAN_MAX = 64               # collect_retired inspects at most this many ids per batch
@@ -224,6 +229,16 @@ class Distribution:
             # remembers which ids were issued and never recycles them.
             db.execute("UPDATE revision_seq SET high = MAX(high, "
                        "COALESCE((SELECT MAX(id) FROM revision), 0)) WHERE slot=1")
+            # Library branch identity for recovery drills. One stable random
+            # identifier per database file: seeded on first open after upgrade,
+            # never changed in place afterwards; fork_recovery gives each copy
+            # a fresh one. Competing first-opens race a single INSERT OR IGNORE,
+            # and every later reader sees the stored winner.
+            db.executescript("""CREATE TABLE IF NOT EXISTS library_meta (
+                slot INTEGER PRIMARY KEY CHECK (slot=1),
+                branch TEXT NOT NULL);""")
+            db.execute("INSERT OR IGNORE INTO library_meta VALUES (1, ?)",
+                       (secrets.token_hex(16),))
 
     def stage(self, config):
         if (type(config) is not dict or set(config) != {"upstream", "timeout_ms"}
@@ -445,6 +460,91 @@ class Distribution:
             return {"deleted": deleted, "retained": retained, "next_after": next_after}
 
     # ------------------------------------------------------------------
+    # Recovery forks: an independently publishable copy of this library for
+    # local disaster-recovery drills. The copy is written to a temporary file
+    # in the destination directory and appears at the final path atomically
+    # (hard link, no clobber), so the destination is never observable
+    # half-made and a same-path race has exactly one winner.
+    # ------------------------------------------------------------------
+
+    def fork_recovery(self, destination):
+        """Copy this library to a new standalone file; return its branch id.
+
+        The copy reflects one committed state of the source observed between
+        the start of this call and the appearance of the destination file:
+        the full pointer and generation, group bindings with their replay
+        window, staged bodies, the version high-water mark, the retirement
+        registry and every live pin all come from that single point. An
+        in-flight canary is NOT carried over (the source trial keeps running
+        untouched); the copy may immediately open its own trial, whose id
+        never reuses the dropped one, and no generation advances and no body
+        is collected because of the drop.
+
+        ``destination`` must not exist yet (FileExistsError otherwise, never
+        clobbered); its parent directory must exist (OSError otherwise). The
+        new file opens on its own with ``Distribution(destination)`` and may
+        be moved away from the source directory by itself. On any failure the
+        final path is left absent and temporary files are removed.
+        """
+        dest = os.fspath(destination)
+        if os.path.lexists(dest):
+            raise FileExistsError(errno.EEXIST, "destination already exists", dest)
+        parent = os.path.dirname(dest) or "."
+        # The temporary file is created next to the destination so the final
+        # os.link is atomic on the same filesystem. A missing parent surfaces
+        # here as the usual file error.
+        fd, temp = tempfile.mkstemp(
+            prefix=os.path.basename(dest) + ".", suffix=".fork", dir=parent)
+        os.close(fd)
+        try:
+            # SQLite's online backup streams the database page by page under a
+            # read transaction: the copy is transactionally consistent, memory
+            # use stays independent of the library size, and on a WAL source
+            # other connections keep committing while the copy runs.
+            with closing(sqlite3.connect(self.path, timeout=30)) as src, \
+                    closing(sqlite3.connect(temp, timeout=30)) as dst:
+                src.backup(dst)
+            with closing(sqlite3.connect(temp, timeout=30)) as fix, fix:
+                # Detach the copy from WAL mode so the single file is fully
+                # self-contained (no -wal/-shm siblings to carry along).
+                mode = fix.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+                if mode != "delete":
+                    raise RuntimeError(
+                        "recovery copy could not be made standalone (journal_mode=%s)"
+                        % mode)
+                fix.execute("BEGIN IMMEDIATE")
+                row = fix.execute(
+                    "SELECT branch FROM library_meta WHERE slot=1").fetchone()
+                if row is None:
+                    raise RuntimeError("source database has no branch identifier")
+                new_branch = secrets.token_hex(16)
+                while new_branch == row[0]:
+                    new_branch = secrets.token_hex(16)
+                fix.execute("UPDATE library_meta SET branch=? WHERE slot=1",
+                            (new_branch,))
+                # Drop the in-flight trial only on the copy. sqlite_sequence
+                # was copied along, so the next trial id stays strictly
+                # greater than the dropped one; channel/group epochs and
+                # staged bodies are deliberately left alone.
+                fix.execute("DELETE FROM canary_member")
+                fix.execute("DELETE FROM canary")
+            # Atomic no-clobber publication: loser's FileExistsError leaves
+            # the winner's file (and any pre-existing entry) untouched.
+            os.link(temp, dest)
+        except BaseException:
+            for leftover in (temp, temp + "-wal", temp + "-shm", temp + "-journal"):
+                try:
+                    os.unlink(leftover)
+                except OSError:
+                    pass
+            raise
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        return new_branch
+
+    # ------------------------------------------------------------------
     # Configuration groups: atomic multi-component publishing with an
     # independent group epoch and a fixed 256-epoch replay window.
     # ------------------------------------------------------------------
@@ -612,6 +712,80 @@ class Distribution:
             remove = tuple(sorted(old_scope - current_scope))
             return {"epoch": current_epoch, "mode": "delta",
                     "put": put, "remove": remove}
+
+    def poll_group_cursor(self, roots, *, cursor=None):
+        """poll_group variant carrying a (branch, epoch) cursor.
+
+        Same roots and reply shape as poll_group, plus a "cursor" entry on
+        every non-empty reply naming the branch and epoch the reply was
+        actually built from. A cursor minted by a DIFFERENT library always
+        yields a full reply for this library's current branch — the whole
+        managed set is replaced, never merged, so components that only exist
+        on the other library are dropped; the foreign epoch is never
+        interpreted against this library's history (not even as a future
+        epoch). Same-branch cursors follow the plain epoch rules: current
+        epoch returns None, an in-window epoch yields an exact delta, an
+        expired epoch falls back to full, a future epoch raises ValueError.
+        """
+        if type(roots) is not tuple or not (1 <= len(roots) <= _GROUP_MAX_ROOTS):
+            raise ValueError(
+                "roots must be a tuple of 1-%d distinct component names" % _GROUP_MAX_ROOTS)
+        for name in roots:
+            if type(name) is not str or _IDENT_RE.fullmatch(name) is None:
+                raise ValueError("roots must be valid component names")
+        if len(set(roots)) != len(roots):
+            raise ValueError("root component names must be distinct")
+        if cursor is not None:
+            if (type(cursor) is not tuple or len(cursor) != 2
+                    or type(cursor[0]) is not str
+                    or _BRANCH_RE.fullmatch(cursor[0]) is None
+                    or type(cursor[1]) is not int
+                    or not (0 <= cursor[1] <= _MAX_ID)):
+                raise ValueError(
+                    "cursor must be None or a (branch, epoch) tuple: branch is 32 "
+                    "lowercase hex characters, epoch an integer in [0, %d]" % _MAX_ID)
+
+        with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
+            # One read transaction, exactly like poll_group: branch, epoch,
+            # history and config bodies in a reply all come from this single
+            # snapshot, so a switch-over reply is never stitched together
+            # from two points in time.
+            db.execute("BEGIN")
+            branch, current_epoch, base_epoch = db.execute(
+                "SELECT m.branch, g.epoch, g.base_epoch FROM library_meta m, "
+                "group_meta g WHERE m.slot=1 AND g.slot=1").fetchone()
+
+            if cursor is not None and cursor[0] != branch:
+                # Foreign cursor: replace the entire managed installation
+                # with this branch's current scope, whatever the epoch says.
+                current = _load_group_snapshot(db, current_epoch)
+                put = _load_configs(db, current, _group_scope(current, roots))
+                return {"epoch": current_epoch, "mode": "full", "put": put,
+                        "remove": (), "cursor": (branch, current_epoch)}
+
+            known_epoch = None if cursor is None else cursor[1]
+            if known_epoch == current_epoch:
+                return None
+            if known_epoch is not None and known_epoch > current_epoch:
+                raise ValueError("cursor epoch %d is in the future" % known_epoch)
+
+            current = _load_group_snapshot(db, current_epoch)
+            current_scope = _group_scope(current, roots)
+
+            if known_epoch is None or known_epoch < base_epoch:
+                put = _load_configs(db, current, current_scope)
+                return {"epoch": current_epoch, "mode": "full", "put": put,
+                        "remove": (), "cursor": (branch, current_epoch)}
+
+            old = _load_group_snapshot(db, known_epoch)
+            old_scope = _group_scope(old, roots)
+            put_names = {
+                name for name in current_scope
+                if name not in old_scope or old[name][0] != current[name][0]}
+            put = _load_configs(db, current, put_names)
+            remove = tuple(sorted(old_scope - current_scope))
+            return {"epoch": current_epoch, "mode": "delta", "put": put,
+                    "remove": remove, "cursor": (branch, current_epoch)}
 
 
 def _protected_revisions(db, candidates):

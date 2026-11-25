@@ -28,6 +28,12 @@ _MAX_ZONES = 24
 _MAX_RUNTIMES = 10
 _MAX_LOAD = 1_000_000
 _MAX_BUDGET = 24_000_000
+# Hot reload: in-memory switchover jobs built from two retained group epochs.
+_HOT_MAX_SLOTS = 128
+_HOT_MAX_BODY_BYTES = 256 * 1024
+_HOT_MIN_WEIGHT = 1
+_HOT_MAX_WEIGHT = 1_000_000
+_HOT_MAX_CAPACITY = 128_000_000
 
 
 def _validate_roster(roster, max_load):
@@ -786,6 +792,451 @@ class Distribution:
             remove = tuple(sorted(old_scope - current_scope))
             return {"epoch": current_epoch, "mode": "delta", "put": put,
                     "remove": remove, "cursor": (branch, current_epoch)}
+
+    # ------------------------------------------------------------------
+    # Hot reload: one in-memory job describing how a node can move a set of
+    # roots between two retained group epochs one entry-point switch at a
+    # time, loading new slots into spare capacity before switching and only
+    # freeing an old slot once no root still serves from it. The job snapshots
+    # both endpoints at preparation time; later publishes never alter it.
+    # ------------------------------------------------------------------
+
+    def prepare_hot_reload(self, roots, *, from_epoch, to_epoch, weights):
+        # Pure shape validation first, mirroring poll_group's root format.
+        if type(roots) is not tuple or not (1 <= len(roots) <= _GROUP_MAX_ROOTS):
+            raise ValueError(
+                "roots must be a tuple of 1-%d distinct component names"
+                % _GROUP_MAX_ROOTS)
+        for name in roots:
+            if type(name) is not str or _IDENT_RE.fullmatch(name) is None:
+                raise ValueError("roots must be valid component names")
+        if len(set(roots)) != len(roots):
+            raise ValueError("root component names must be distinct")
+        if type(from_epoch) is not int or type(to_epoch) is not int:
+            raise ValueError("epochs must be integers")
+        if not (0 <= from_epoch < to_epoch):
+            raise ValueError("require 0 <= from_epoch < to_epoch")
+        if type(weights) is not dict:
+            raise ValueError("weights must be a dict keyed by (component, revision) slots")
+
+        with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
+            # One read snapshot for both endpoints, every binding and every
+            # config body, so the job is never stitched across two publishes.
+            db.execute("BEGIN")
+            current_epoch, base_epoch = db.execute(
+                "SELECT epoch, base_epoch FROM group_meta WHERE slot=1").fetchone()
+            if not (base_epoch <= from_epoch <= current_epoch
+                    and base_epoch <= to_epoch <= current_epoch):
+                raise ValueError(
+                    "both epochs must remain inside the retained group window "
+                    "[%d, %d]" % (base_epoch, current_epoch))
+
+            old_group = _load_group_snapshot(db, from_epoch)
+            new_group = _load_group_snapshot(db, to_epoch)
+            for name in roots:
+                if name not in old_group:
+                    raise ValueError(
+                        "root %r is absent from group epoch %d" % (name, from_epoch))
+                if name not in new_group:
+                    raise ValueError(
+                        "root %r is absent from group epoch %d" % (name, to_epoch))
+
+            old_scopes = {}
+            new_scopes = {}
+            for name in roots:
+                old_scopes[name] = _group_scope(old_group, (name,))
+                new_scopes[name] = _group_scope(new_group, (name,))
+
+            def slot_of(group, component):
+                return component, group[component][0]
+
+            old_slots = set()
+            new_slots = set()
+            for name in roots:
+                old_slots.update(slot_of(old_group, c) for c in old_scopes[name])
+                new_slots.update(slot_of(new_group, c) for c in new_scopes[name])
+            all_slots = old_slots | new_slots
+            if len(all_slots) > _HOT_MAX_SLOTS:
+                raise ValueError(
+                    "a hot reload job may span at most %d distinct slots; got %d"
+                    % (_HOT_MAX_SLOTS, len(all_slots)))
+
+            # Bodies are read as the exact stored JSON text and sized on their
+            # UTF-8 encoding, exactly as they sit in the inventory.
+            revisions = tuple(sorted({revision for _name, revision in all_slots}))
+            placeholders = ",".join("?" for _ in revisions)
+            rows = db.execute(
+                "SELECT id, config FROM revision WHERE id IN (%s)" % placeholders,
+                revisions).fetchall()
+            bodies = dict(rows)
+            missing = [revision for revision in revisions if revision not in bodies]
+            if missing:
+                raise KeyError(missing[0])
+            for revision, text in rows:
+                if len(text.encode("utf-8")) > _HOT_MAX_BODY_BYTES:
+                    raise ValueError(
+                        "config body of revision %d exceeds %d UTF-8 bytes"
+                        % (revision, _HOT_MAX_BODY_BYTES))
+            slot_bodies = {
+                slot: bodies[slot[1]] for slot in all_slots}
+
+            normalized_weights = {}
+            for slot, weight in weights.items():
+                if (type(slot) is not tuple or len(slot) != 2
+                        or type(slot[0]) is not str
+                        or type(slot[1]) is not int):
+                    raise ValueError(
+                        "weight keys must be (component name, revision) tuples")
+                if type(weight) is not int or not (
+                        _HOT_MIN_WEIGHT <= weight <= _HOT_MAX_WEIGHT):
+                    raise ValueError(
+                        "weights must be integers in [%d, %d]"
+                        % (_HOT_MIN_WEIGHT, _HOT_MAX_WEIGHT))
+                normalized_weights[slot] = weight
+            if set(normalized_weights) != all_slots:
+                missing_keys = sorted(all_slots - set(normalized_weights))
+                extra_keys = sorted(set(normalized_weights) - all_slots)
+                raise ValueError(
+                    "weights must cover exactly the job slots; missing=%r extra=%r"
+                    % (missing_keys, extra_keys))
+
+            # Per-root transitive scopes resolved straight into slots, so the
+            # job never has to revisit component graph structure again.
+            old_need = {
+                name: frozenset(slot_of(old_group, c) for c in old_scopes[name])
+                for name in roots}
+            new_need = {
+                name: frozenset(slot_of(new_group, c) for c in new_scopes[name])
+                for name in roots}
+            return HotReloadJob(
+                roots=tuple(roots),
+                from_epoch=from_epoch,
+                to_epoch=to_epoch,
+                old_need=old_need,
+                new_need=new_need,
+                slots=frozenset(all_slots),
+                slot_bodies=slot_bodies,
+                weights=normalized_weights)
+
+
+class HotReloadJob:
+    """Immutable, in-memory hot-reload job between two retained group epochs.
+
+    A job is held by its caller for the lifetime of the rollout: it never
+    touches the database after construction, cannot be resumed across
+    processes, and later publishes cannot change its endpoints, bodies or
+    step decisions. Every accepted action is only simulated; the node itself
+    is never operated on.
+    """
+
+    def __init__(self, *, roots, from_epoch, to_epoch, old_need, new_need,
+                 slots, slot_bodies, weights):
+        self._roots = tuple(roots)
+        self._from_epoch = from_epoch
+        self._to_epoch = to_epoch
+        # Per-root transitive scopes expressed directly as (name, revision)
+        # slots, keyed by root for either side of the switch.
+        self._old_need = {root: frozenset(old_need[root]) for root in roots}
+        self._new_need = {root: frozenset(new_need[root]) for root in roots}
+        self._slots = frozenset(slots)
+        # Stored JSON text, never parsed at preparation time; each delivery
+        # re-parses a fresh object so a caller mutating a returned config
+        # cannot influence any later call.
+        self._bodies = dict(slot_bodies)
+        self._weights = dict(weights)
+        self._root_set = frozenset(roots)
+
+    # ------------------------------------------------------------------
+    # Shared state validation. A state is two duplicate-free tuples of job
+    # members whose loaded set still covers every slot the roots currently
+    # serve from (each unswitched root its old side, each switched root its
+    # new side). Caller inputs are never mutated.
+    # ------------------------------------------------------------------
+
+    def _normalized_state(self, state):
+        if type(state) is not dict or set(state) != {"switched", "loaded"}:
+            raise ValueError(
+                "state must be a dict with exactly 'switched' and 'loaded'")
+        switched_raw, loaded_raw = state["switched"], state["loaded"]
+        if type(switched_raw) is not tuple or type(loaded_raw) is not tuple:
+            raise ValueError("state entries must be tuples")
+        if len(set(switched_raw)) != len(switched_raw):
+            raise ValueError("switched must not contain duplicates")
+        if len(set(loaded_raw)) != len(loaded_raw):
+            raise ValueError("loaded must not contain duplicates")
+        switched = set()
+        for root in switched_raw:
+            if type(root) is not str or root not in self._root_set:
+                raise ValueError("unknown root in state: %r" % (root,))
+            switched.add(root)
+        loaded = set()
+        for slot in loaded_raw:
+            if not self._is_known_slot(slot):
+                raise ValueError("unknown slot in state: %r" % (slot,))
+            loaded.add(slot)
+        missing = self._active_slots(switched) - loaded
+        if missing:
+            raise ValueError(
+                "state is missing slots required by roots in service: %r"
+                % (sorted(missing),))
+        return switched, loaded
+
+    def _active_slots(self, switched):
+        active = set()
+        for root in self._roots:
+            active.update(
+                self._new_need[root] if root in switched else self._old_need[root])
+        return active
+
+    def _is_known_slot(self, slot):
+        return (type(slot) is tuple and len(slot) == 2
+                and type(slot[0]) is str and type(slot[1]) is int
+                and slot in self._slots)
+
+    def _loaded_weight(self, loaded):
+        return sum(self._weights[slot] for slot in loaded)
+
+    @staticmethod
+    def _sorted_tuple(values):
+        return tuple(sorted(values))
+
+    def initial_state(self):
+        loaded = set()
+        for root in self._roots:
+            loaded.update(self._old_need[root])
+        return {"switched": (), "loaded": self._sorted_tuple(loaded)}
+
+    def step(self, state, action, *, capacity):
+        if type(capacity) is not int or not (0 <= capacity <= _HOT_MAX_CAPACITY):
+            raise ValueError(
+                "capacity must be an integer in [0, %d]" % _HOT_MAX_CAPACITY)
+        switched, loaded = self._normalized_state(state)
+        current_weight = self._loaded_weight(loaded)
+        if current_weight > capacity:
+            raise ValueError(
+                "loaded weight %d already exceeds capacity %d"
+                % (current_weight, capacity))
+
+        if type(action) is not tuple or len(action) != 2:
+            raise ValueError("action must be a (verb, target) tuple")
+        verb, target = action
+
+        if verb == "load":
+            slot = target
+            if (type(slot) is not tuple or len(slot) != 2
+                    or type(slot[0]) is not str
+                    or type(slot[1]) is not int
+                    or slot not in self._slots):
+                raise ValueError("unknown load slot: %r" % (slot,))
+            if slot in loaded:
+                return None
+            new_weight = current_weight + self._weights[slot]
+            if new_weight > capacity:
+                return None
+            new_loaded = loaded | {slot}
+            return {
+                "state": {"switched": self._sorted_tuple(switched),
+                          "loaded": self._sorted_tuple(new_loaded)},
+                "config": json.loads(self._bodies[slot])}
+
+        if verb == "switch":
+            root = target
+            if type(root) is not str or root not in self._root_set:
+                raise ValueError("unknown switch root: %r" % (root,))
+            if root in switched:
+                return None
+            if not self._new_need[root] <= loaded:
+                return None
+            # A switch neither loads nor unloads slots and never touches
+            # other roots; old slots stay resident until explicitly unloaded.
+            new_switched = switched | {root}
+            return {
+                "state": {"switched": self._sorted_tuple(new_switched),
+                          "loaded": self._sorted_tuple(loaded)},
+                "config": None}
+
+        if verb == "unload":
+            slot = target
+            if (type(slot) is not tuple or len(slot) != 2
+                    or type(slot[0]) is not str
+                    or type(slot[1]) is not int
+                    or slot not in self._slots):
+                raise ValueError("unknown unload slot: %r" % (slot,))
+            if slot not in loaded:
+                return None
+            if slot in self._active_slots(switched):
+                return None
+            new_loaded = loaded - {slot}
+            return {
+                "state": {"switched": self._sorted_tuple(switched),
+                          "loaded": self._sorted_tuple(new_loaded)},
+                "config": None}
+
+        raise ValueError("action verb must be one of 'load', 'switch', 'unload'")
+
+    def plan(self, state, *, capacity):
+        if type(capacity) is not int or not (0 <= capacity <= _HOT_MAX_CAPACITY):
+            raise ValueError(
+                "capacity must be an integer in [0, %d]" % _HOT_MAX_CAPACITY)
+        switched, loaded = self._normalized_state(state)
+        start_weight = self._loaded_weight(loaded)
+
+        required_capacity, actions = self._solve(switched, loaded)
+        if capacity < required_capacity:
+            return {"required_capacity": required_capacity, "actions": None}
+        return {"required_capacity": required_capacity, "actions": actions}
+
+    def _solve(self, switched, loaded):
+        """Minimum-peak rollout via subset dynamic programming.
+
+        States are subsets of already-switched roots (at most 2**16); no root
+        permutation is ever enumerated. For a fixed switch order, evicting
+        every slot as early as possible and loading each new slot as late as
+        possible keeps the resident weight pointwise minimal, so no plan can
+        beat this transition's peak:
+
+            resident before switching root r = active(S) union new_need(r)
+
+        where active(S) is what the roots currently serve from. Unloads only
+        shrink the resident set and are free, hence they never raise the
+        peak; the start state's actual loaded weight is the first peak.
+        """
+        n = len(self._roots)
+        index = {root: i for i, root in enumerate(self._roots)}
+        full = (1 << n) - 1
+        start_bits = 0
+        for root in switched:
+            start_bits |= 1 << index[root]
+        start_weight = self._loaded_weight(loaded)
+
+        if start_bits == full:
+            # Already on the target side; the only work left is dropping
+            # surplus slots, which cannot exceed the starting weight.
+            return start_weight, self._closing_unloads(switched, loaded)
+
+        old_need = self._old_need
+        new_need = self._new_need
+        weights = self._weights
+        roots = self._roots
+
+        # Encode every slot as one bit in a Python int so subset unions and
+        # weights stay compact (at most 128 slots). Per-root old/new scopes
+        # become integer masks; a slot's weight is read through a small list.
+        slot_list = sorted(self._slots)
+        slot_bit = {slot: 1 << i for i, slot in enumerate(slot_list)}
+        slot_weight = [weights[slot] for slot in slot_list]
+        old_mask = [0] * n
+        new_mask = [0] * n
+        for i, root in enumerate(roots):
+            m_old = m_new = 0
+            for slot in old_need[root]:
+                m_old |= slot_bit[slot]
+            for slot in new_need[root]:
+                m_new |= slot_bit[slot]
+            old_mask[i] = m_old
+            new_mask[i] = m_new
+
+        def mask_weight(mask):
+            total = 0
+            while mask:
+                low = mask & -mask
+                total += slot_weight[low.bit_length() - 1]
+                mask ^= low
+            return total
+
+        # active_mask[bits]: live service slots once the roots in bits have
+        # switched (new side for bits, old side for the rest). The union
+        # naturally excludes slots no root serves from.
+        size = 1 << n
+        active_mask = [0] * size
+        active_weight = [0] * size
+        for bits in range(size):
+            mask = 0
+            for i in range(n):
+                mask |= new_mask[i] if (bits & (1 << i)) else old_mask[i]
+            active_mask[bits] = mask
+            active_weight[bits] = mask_weight(mask)
+
+        # Peak when switching root i at subset bits is the weight of
+        # active(bits) union new_need(i); computed on demand from the masks,
+        # so no (2**n)*n transition table is retained.
+        def transition(bits, i):
+            merged = active_mask[bits] | new_mask[i]
+            extra = merged ^ active_mask[bits]
+            return active_weight[bits] + mask_weight(extra)
+
+        peak = [None] * size
+        parent = [None] * size  # (previous_bits, root_index)
+        peak[start_bits] = start_weight
+
+        # Ascending integer order is a topological order over subset edges,
+        # since every transition adds one bit and yields a larger integer.
+        for bits in range(start_bits, size):
+            if peak[bits] is None:
+                continue
+            base_peak = peak[bits]
+            remaining = full ^ bits
+            while remaining:
+                low = remaining & -remaining
+                i = low.bit_length() - 1
+                remaining ^= low
+                nxt = bits | low
+                cand = max(base_peak, transition(bits, i))
+                if peak[nxt] is None or cand < peak[nxt] or (
+                        cand == peak[nxt] and roots[i] < roots[parent[nxt][1]]):
+                    peak[nxt] = cand
+                    parent[nxt] = (bits, i)
+
+        # Reconstruct the chosen switch order, then expand it into concrete
+        # legal load/switch/unload actions matching the DP resident sets.
+        order = []
+        bits = full
+        while bits != start_bits:
+            prev, i = parent[bits]
+            order.append(i)
+            bits = prev
+        order.reverse()
+        actions = self._replay_actions(switched, loaded, order)
+        return peak[full], tuple(actions)
+
+    def _closing_unloads(self, switched, loaded):
+        surplus = loaded - self._active_slots(switched)
+        return tuple(("unload", slot) for slot in sorted(surplus))
+
+    def _replay_actions(self, switched, loaded, order):
+        """Expand the chosen switch order into actions step() will accept.
+
+        Before every switch the replay holds exactly active(S) plus the next
+        root's target scope (the DP's pointwise-minimal resident set): slots
+        no root serves from and the next switch does not need are unloaded
+        first, the target's missing slots are loaded, then the root switches.
+        Surplus slots in the start state are dropped up front; the job ends
+        loaded with exactly the union of the target-side scopes.
+        """
+        current_switched = set(switched)
+        current_loaded = set(loaded)
+        pending = list(order)
+        actions = []
+
+        def trim(imminent):
+            keep = self._active_slots(current_switched)
+            if imminent is not None:
+                keep = keep | self._new_need[self._roots[imminent]]
+            for slot in sorted(current_loaded - keep):
+                actions.append(("unload", slot))
+                current_loaded.remove(slot)
+
+        trim(pending[0] if pending else None)
+        while pending:
+            i = pending.pop(0)
+            root = self._roots[i]
+            for slot in sorted(self._new_need[root] - current_loaded):
+                actions.append(("load", slot))
+                current_loaded.add(slot)
+            actions.append(("switch", root))
+            current_switched.add(root)
+            trim(pending[0] if pending else None)
+        return actions
 
 
 def _protected_revisions(db, candidates):

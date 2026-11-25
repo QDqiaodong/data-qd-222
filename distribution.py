@@ -10,6 +10,11 @@ class ConflictingPromotion(Exception):
 
 
 _IDENT_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+_GROUP_WINDOW = 256          # group epochs kept reconstructable, including the current one
+_GROUP_MAX_COMPONENTS = 2048
+_GROUP_MAX_CHANGES = 32
+_GROUP_MAX_NEEDS = 8
+_GROUP_MAX_ROOTS = 16
 _MAX_ROSTER = 2400
 _MAX_ZONES = 24
 _MAX_RUNTIMES = 10
@@ -133,6 +138,29 @@ class Distribution:
                 delivered INTEGER NOT NULL DEFAULT 0,
                 acked INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (trial_id, instance_id));""")
+            # Configuration-group path. All tables are additive: an existing
+            # database opens unchanged and gains the group path without a rebuild.
+            # Group rows reference the same immutable revisions as the single
+            # channel; configuration bodies are never copied into group tables.
+            db.executescript("""CREATE TABLE IF NOT EXISTS group_meta (
+                slot INTEGER PRIMARY KEY CHECK (slot=1),
+                epoch INTEGER NOT NULL,
+                base_epoch INTEGER NOT NULL);
+                INSERT OR IGNORE INTO group_meta VALUES (1, 0, 0);
+                CREATE TABLE IF NOT EXISTS group_binding (
+                name TEXT PRIMARY KEY,
+                revision INTEGER NOT NULL,
+                needs TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS group_event (
+                epoch INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                revision INTEGER,
+                needs TEXT,
+                PRIMARY KEY (epoch, name)) WITHOUT ROWID;
+                CREATE TABLE IF NOT EXISTS group_base (
+                name TEXT PRIMARY KEY,
+                revision INTEGER NOT NULL,
+                needs TEXT NOT NULL) WITHOUT ROWID;""")
 
     def stage(self, config):
         if (type(config) is not dict or set(config) != {"upstream", "timeout_ms"}
@@ -250,3 +278,247 @@ class Distribution:
             db.execute("DELETE FROM canary_member WHERE trial_id = ?", (trial_id,))
             db.execute("DELETE FROM canary WHERE id = ?", (trial_id,))
             return True
+
+    # ------------------------------------------------------------------
+    # Configuration groups: atomic multi-component publishing with an
+    # independent group epoch and a fixed 256-epoch replay window.
+    # ------------------------------------------------------------------
+
+    def _current_epoch(self):
+        with closing(sqlite3.connect(self.path)) as db:
+            return db.execute(
+                "SELECT epoch FROM group_meta WHERE slot=1").fetchone()[0]
+
+    def publish_group(self, changes, *, expected_epoch):
+        # Pure argument validation first, before any transaction or state
+        # touch: every rejection leaves group content, epoch and history intact.
+        if type(changes) is not dict or not (1 <= len(changes) <= _GROUP_MAX_CHANGES):
+            raise ValueError(
+                "changes must be a dict of 1-%d component entries" % _GROUP_MAX_CHANGES)
+        if type(expected_epoch) is not int:
+            raise ValueError("expected_epoch must be an integer")
+        parsed = {}
+        for name, binding in changes.items():
+            if type(name) is not str or _IDENT_RE.fullmatch(name) is None:
+                raise ValueError(
+                    "component names must be 1-64 ASCII characters of letters, "
+                    "digits, '-' or '_'")
+            if binding is None:
+                parsed[name] = None
+                continue
+            if type(binding) is not tuple or len(binding) != 2:
+                raise ValueError("component binding must be None or a (revision, needs) tuple")
+            revision, needs = binding
+            if type(revision) is not int or revision <= 0:
+                raise ValueError("revision must be a positive integer returned by stage()")
+            if type(needs) is not dict or len(needs) > _GROUP_MAX_NEEDS:
+                raise ValueError(
+                    "needs must be a dict of at most %d dependency entries" % _GROUP_MAX_NEEDS)
+            normalized_needs = {}
+            for dep_name, dep_revision in needs.items():
+                if type(dep_name) is not str or _IDENT_RE.fullmatch(dep_name) is None:
+                    raise ValueError("dependency names must be valid component names")
+                if type(dep_revision) is not int or dep_revision <= 0:
+                    raise ValueError("dependency versions must be exact positive integers")
+                normalized_needs[dep_name] = dep_revision
+            parsed[name] = (revision, normalized_needs)
+
+        with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            current_epoch, base_epoch = db.execute(
+                "SELECT epoch, base_epoch FROM group_meta WHERE slot=1").fetchone()
+            if current_epoch != expected_epoch:
+                raise ConflictingPromotion(expected_epoch)
+
+            # All directly staged revisions must exist. A missing staged
+            # revision is a KeyError, distinct from structural ValueErrors.
+            staged = {row[0] for row in db.execute("SELECT id FROM revision")}
+            for binding in parsed.values():
+                if binding is not None and binding[0] not in staged:
+                    raise KeyError(binding[0])
+
+            # Build the prospective whole group by overlaying the batch onto
+            # the current bindings. Validation runs against the final group,
+            # never against intermediate per-change states.
+            group = {
+                row[0]: (row[1], json.loads(row[2]))
+                for row in db.execute("SELECT name, revision, needs FROM group_binding")}
+            for name, binding in parsed.items():
+                if binding is None:
+                    group.pop(name, None)
+                else:
+                    group[name] = binding
+            if len(group) > _GROUP_MAX_COMPONENTS:
+                raise ValueError(
+                    "a published group may contain at most %d components" % _GROUP_MAX_COMPONENTS)
+            for name, (_, needs) in group.items():
+                for dep_name, dep_revision in needs.items():
+                    target = group.get(dep_name)
+                    if target is None or target[0] != dep_revision:
+                        raise ValueError(
+                            "component %r requires %s@%d which is absent or bound to another "
+                            "revision in the published group" % (name, dep_name, dep_revision))
+            if _group_has_cycle(group):
+                raise ValueError("the published group must not contain a dependency cycle")
+
+            new_epoch = current_epoch + 1
+            for name, binding in parsed.items():
+                if binding is None:
+                    db.execute("DELETE FROM group_binding WHERE name=?", (name,))
+                    db.execute(
+                        "INSERT INTO group_event(epoch, name, revision, needs) "
+                        "VALUES (?, ?, NULL, NULL)", (new_epoch, name))
+                else:
+                    revision, needs = binding
+                    db.execute(
+                        "INSERT INTO group_binding(name, revision, needs) VALUES (?, ?, ?) "
+                        "ON CONFLICT(name) DO UPDATE SET revision=excluded.revision, "
+                        "needs=excluded.needs",
+                        (name, revision, json.dumps(needs, sort_keys=True)))
+                    db.execute(
+                        "INSERT INTO group_event(epoch, name, revision, needs) "
+                        "VALUES (?, ?, ?, ?)",
+                        (new_epoch, name, revision,
+                         json.dumps(needs, sort_keys=True)))
+            db.execute("UPDATE group_meta SET epoch=? WHERE slot=1", (new_epoch,))
+
+            # Keep exactly the latest _GROUP_WINDOW epochs (including the
+            # current one) reconstructable. When the window fills, fold the
+            # epoch falling out of the window into a moving baseline and drop
+            # its events; no full per-epoch group copies are ever stored.
+            if new_epoch >= _GROUP_WINDOW:
+                retained_low = new_epoch - _GROUP_WINDOW + 1
+                if base_epoch < retained_low:
+                    snapshot = _load_group_snapshot(db, retained_low)
+                    db.execute("DELETE FROM group_base")
+                    db.executemany(
+                        "INSERT INTO group_base(name, revision, needs) VALUES (?, ?, ?)",
+                        [(name, revision, json.dumps(needs, sort_keys=True))
+                         for name, (revision, needs) in sorted(snapshot.items())])
+                    db.execute(
+                        "DELETE FROM group_event WHERE epoch <= ?", (retained_low,))
+                    db.execute(
+                        "UPDATE group_meta SET base_epoch=? WHERE slot=1", (retained_low,))
+            return new_epoch
+
+    def poll_group(self, roots, *, known_epoch=None):
+        if type(roots) is not tuple or not (1 <= len(roots) <= _GROUP_MAX_ROOTS):
+            raise ValueError(
+                "roots must be a tuple of 1-%d distinct component names" % _GROUP_MAX_ROOTS)
+        for name in roots:
+            if type(name) is not str or _IDENT_RE.fullmatch(name) is None:
+                raise ValueError("roots must be valid component names")
+        if len(set(roots)) != len(roots):
+            raise ValueError("root component names must be distinct")
+        if known_epoch is not None:
+            if type(known_epoch) is not int or known_epoch < 0:
+                raise ValueError("known_epoch must be a non-negative integer or None")
+
+        with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
+            # Pin one read transaction for the whole reply: every SELECT below
+            # (epoch, current bindings, historical reconstruction, config
+            # bodies) shares a single snapshot, so a reply is never stitched
+            # together from points on either side of a concurrent publish.
+            db.execute("BEGIN")
+            current_epoch, base_epoch = db.execute(
+                "SELECT epoch, base_epoch FROM group_meta WHERE slot=1").fetchone()
+            if known_epoch == current_epoch:
+                return None
+            if known_epoch is not None and known_epoch > current_epoch:
+                raise ValueError("known_epoch %d is in the future" % known_epoch)
+
+            current = _load_group_snapshot(db, current_epoch)
+            current_scope = _group_scope(current, roots)
+
+            if known_epoch is None or known_epoch < base_epoch:
+                # First pull, or an epoch older than the retained window: the
+                # old installed scope cannot be reconstructed, so replace the
+                # whole managed set rather than guessing a delta.
+                put = _load_configs(db, current, current_scope)
+                return {"epoch": current_epoch, "mode": "full",
+                        "put": put, "remove": ()}
+
+            old = _load_group_snapshot(db, known_epoch)
+            old_scope = _group_scope(old, roots)
+            put_names = {
+                name for name in current_scope
+                if name not in old_scope or old[name][0] != current[name][0]}
+            put = _load_configs(db, current, put_names)
+            remove = tuple(sorted(old_scope - current_scope))
+            return {"epoch": current_epoch, "mode": "delta",
+                    "put": put, "remove": remove}
+
+
+def _load_group_snapshot(db, epoch):
+    """Reconstruct the whole group as bound at ``epoch`` (must be retained)."""
+    base_epoch = db.execute(
+        "SELECT base_epoch FROM group_meta WHERE slot=1").fetchone()[0]
+    snapshot = {
+        row[0]: (row[1], json.loads(row[2]))
+        for row in db.execute("SELECT name, revision, needs FROM group_base")}
+    rows = db.execute(
+        "SELECT name, revision, needs FROM group_event WHERE ? < epoch AND epoch <= ? "
+        "ORDER BY epoch, name", (base_epoch, epoch))
+    for name, revision, needs in rows:
+        if revision is None:
+            snapshot.pop(name, None)
+        else:
+            snapshot[name] = (revision, json.loads(needs))
+    return snapshot
+
+
+def _group_has_cycle(group):
+    """Iterative DFS over exact-name dependency edges; self-loops count."""
+    state = {}  # 0 = visited once, 1 = on the current DFS stack
+    for start in group:
+        if start in state:
+            continue
+        stack = [(start, iter(group[start][1]))]
+        state[start] = 1
+        while stack:
+            name, edges = stack[-1]
+            advanced = False
+            for dep in edges:
+                if dep not in group:
+                    continue  # dangling edges are reported separately
+                mark = state.get(dep)
+                if mark == 1:
+                    return True
+                if mark is None:
+                    state[dep] = 1
+                    stack.append((dep, iter(group[dep][1])))
+                    advanced = True
+                    break
+            if not advanced:
+                state[name] = 0
+                stack.pop()
+    return False
+
+
+def _group_scope(group, roots):
+    """Union of the roots and their transitive exact-name dependencies."""
+    scope = set()
+    stack = [name for name in roots if name in group]
+    while stack:
+        name = stack.pop()
+        if name in scope:
+            continue
+        scope.add(name)
+        for dep in group[name][1]:
+            if dep in group and dep not in scope:
+                stack.append(dep)
+    return scope
+
+
+def _load_configs(db, group, names):
+    """Map component names to (revision, config) without copying bodies twice."""
+    if not names:
+        return {}
+    revisions = tuple(sorted({group[name][0] for name in names}))
+    placeholders = ",".join("?" for _ in revisions)
+    configs = {
+        row[0]: json.loads(row[1])
+        for row in db.execute(
+            "SELECT id, config FROM revision WHERE id IN (%s)" % placeholders,
+            revisions)}
+    return {name: (group[name][0], configs[group[name][0]]) for name in sorted(names)}

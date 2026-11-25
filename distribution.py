@@ -10,6 +10,9 @@ class ConflictingPromotion(Exception):
 
 
 _IDENT_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+_MAX_ID = (1 << 63) - 1      # revision, pin and cursor ids are positive 63-bit integers
+_BATCH_MAX = 32              # retire/pin batches accept at most this many ids
+_SCAN_MAX = 64               # collect_retired inspects at most this many ids per batch
 _GROUP_WINDOW = 256          # group epochs kept reconstructable, including the current one
 _GROUP_MAX_COMPONENTS = 2048
 _GROUP_MAX_CHANGES = 32
@@ -116,6 +119,46 @@ def _choose_members(roster, max_load):
     return best[1]
 
 
+def _is_id(value):
+    """True for an integer in [1, 2**63-1]; bools and floats are not ids."""
+    return type(value) is int and 1 <= value <= _MAX_ID
+
+
+def _validate_batch(revisions):
+    """Normalize a retire/pin batch to a sorted tuple of distinct ids.
+
+    The shape is checked in full before any database access, so a malformed
+    batch can never leave a partial registration behind.
+    """
+    if type(revisions) is not tuple or not (1 <= len(revisions) <= _BATCH_MAX):
+        raise ValueError(
+            "revisions must be a tuple of 1-%d distinct revision ids" % _BATCH_MAX)
+    for revision in revisions:
+        if not _is_id(revision):
+            raise ValueError(
+                "revision ids must be integers in [1, %d]" % _MAX_ID)
+    if len(set(revisions)) != len(revisions):
+        raise ValueError("revision ids in a batch must be distinct")
+    return tuple(sorted(revisions))
+
+
+def _check_id(value, label):
+    if not _is_id(value):
+        raise ValueError("%s must be an integer in [1, %d]" % (label, _MAX_ID))
+    return value
+
+
+def _revision_high_water(db):
+    """Highest version id ever issued, including ids no longer present.
+
+    ``revision_seq`` is persisted (and re-seeded from live rows on open), so
+    the counter survives emptying the revision table and reopening the file.
+    """
+    high = db.execute("SELECT high FROM revision_seq WHERE slot=1").fetchone()[0]
+    top = db.execute("SELECT MAX(id) FROM revision").fetchone()[0] or 0
+    return max(high, top)
+
+
 class Distribution:
     def __init__(self, path):
         self.path = path
@@ -161,15 +204,44 @@ class Distribution:
                 name TEXT PRIMARY KEY,
                 revision INTEGER NOT NULL,
                 needs TEXT NOT NULL) WITHOUT ROWID;""")
+            # Staged-version reclamation. Registration and pin membership are
+            # kept in their own tables; revision bodies are never copied here.
+            db.executescript("""CREATE TABLE IF NOT EXISTS retired_revision (
+                revision INTEGER PRIMARY KEY);
+                CREATE TABLE IF NOT EXISTS pin (
+                id INTEGER PRIMARY KEY AUTOINCREMENT);
+                CREATE TABLE IF NOT EXISTS pin_member (
+                pin_id INTEGER NOT NULL,
+                revision INTEGER NOT NULL,
+                PRIMARY KEY (pin_id, revision)) WITHOUT ROWID;
+                CREATE INDEX IF NOT EXISTS pin_member_revision
+                ON pin_member (revision);
+                CREATE TABLE IF NOT EXISTS revision_seq (
+                slot INTEGER PRIMARY KEY CHECK (slot=1), high INTEGER NOT NULL);
+                INSERT OR IGNORE INTO revision_seq VALUES (1, 0);""")
+            # Seed the version high-water mark from any rows written by an older
+            # build, so an upgrade followed by reclaiming every staged body still
+            # remembers which ids were issued and never recycles them.
+            db.execute("UPDATE revision_seq SET high = MAX(high, "
+                       "COALESCE((SELECT MAX(id) FROM revision), 0)) WHERE slot=1")
 
     def stage(self, config):
         if (type(config) is not dict or set(config) != {"upstream", "timeout_ms"}
                 or not isinstance(config["upstream"], str) or not config["upstream"].strip()
                 or type(config["timeout_ms"]) is not int or config["timeout_ms"] <= 0):
             raise ValueError("configuration requires upstream and a positive integer timeout_ms")
-        with closing(sqlite3.connect(self.path)) as db, db:
-            return db.execute("INSERT INTO revision(config) VALUES (?)",
-                              (json.dumps(config, sort_keys=True),)).lastrowid
+        with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
+            # A separate high-water mark survives emptying the revision table
+            # (and works on databases created before this table existed):
+            # SQLite on its own resets rowid allocation once a table is empty,
+            # which would let a new version reuse an id a stale promotion or
+            # pin still expects to identify old content.
+            db.execute("BEGIN IMMEDIATE")
+            revision = _revision_high_water(db) + 1
+            db.execute("INSERT INTO revision(id, config) VALUES (?, ?)",
+                       (revision, json.dumps(config, sort_keys=True)))
+            db.execute("UPDATE revision_seq SET high=? WHERE slot=1", (revision,))
+            return revision
 
     def promote(self, revision, *, expected_generation):
         with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
@@ -278,6 +350,99 @@ class Distribution:
             db.execute("DELETE FROM canary_member WHERE trial_id = ?", (trial_id,))
             db.execute("DELETE FROM canary WHERE id = ?", (trial_id,))
             return True
+
+    # ------------------------------------------------------------------
+    # Staged-version reclamation. Registering a revision for collection never
+    # removes it; collection deletes bodies only once every legitimate live
+    # reference (full pointer, canary candidate, pin, retained group window)
+    # is gone. Space freed by a delete stays with SQLite for reuse.
+    # ------------------------------------------------------------------
+
+    def retire_revisions(self, revisions):
+        """Register revisions as collectable; never deletes a body now."""
+        batch = _validate_batch(revisions)
+        with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            staged = {row[0] for row in db.execute("SELECT id FROM revision")}
+            for revision in batch:
+                if revision not in staged:
+                    raise KeyError(revision)
+            db.executemany(
+                "INSERT OR IGNORE INTO retired_revision(revision) VALUES (?)",
+                [(revision,) for revision in batch])
+            return None
+
+    def pin_revisions(self, revisions):
+        """Create one immutable pin covering every revision; return its id."""
+        batch = _validate_batch(revisions)
+        with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            staged = {row[0] for row in db.execute("SELECT id FROM revision")}
+            for revision in batch:
+                if revision not in staged:
+                    raise KeyError(revision)
+            pin_id = db.execute("INSERT INTO pin DEFAULT VALUES").lastrowid
+            db.executemany("INSERT INTO pin_member(pin_id, revision) VALUES (?, ?)",
+                           [(pin_id, revision) for revision in batch])
+            return pin_id
+
+    def read_pin(self, pin_id):
+        """Return {revision: config} for a live pin, or None if unknown/released."""
+        _check_id(pin_id, "pin_id")
+        with closing(sqlite3.connect(self.path)) as db, db:
+            # One read snapshot: an unpin cannot slip between the existence
+            # check and the member lookup, so a pin is either fully readable or
+            # reported as unknown/released, never half-empty.
+            db.execute("BEGIN")
+            if not db.execute("SELECT 1 FROM pin WHERE id=?", (pin_id,)).fetchone():
+                return None
+            return {
+                revision: json.loads(config)
+                for revision, config in db.execute(
+                    "SELECT m.revision, r.config FROM pin_member m "
+                    "JOIN revision r ON r.id = m.revision WHERE m.pin_id=? "
+                    "ORDER BY m.revision", (pin_id,))}
+
+    def unpin_revisions(self, pin_id):
+        """Release a pin once; return False for an unknown or already released pin."""
+        _check_id(pin_id, "pin_id")
+        with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM pin WHERE id=?", (pin_id,)).fetchone():
+                return False
+            db.execute("DELETE FROM pin_member WHERE pin_id=?", (pin_id,))
+            db.execute("DELETE FROM pin WHERE id=?", (pin_id,))
+            return True
+
+    def collect_retired(self, *, after=0, scan_limit=64):
+        """Delete unprotected retired revisions in one ascending cursor batch."""
+        if type(after) is not int or not (0 <= after <= _MAX_ID):
+            raise ValueError("after must be an integer in [0, %d]" % _MAX_ID)
+        if type(scan_limit) is not int or not (1 <= scan_limit <= _SCAN_MAX):
+            raise ValueError("scan_limit must be an integer in [1, %d]" % _SCAN_MAX)
+
+        with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
+            # BEGIN IMMEDIATE serialises against stage/pin/publish/collect on
+            # other connections: each candidate's protection test and its
+            # delete observe the same snapshot, so a reference that lands first
+            # keeps the body and a collected id is already gone to late callers.
+            db.execute("BEGIN IMMEDIATE")
+            ids = [row[0] for row in db.execute(
+                "SELECT DISTINCT revision FROM retired_revision "
+                "WHERE revision > ? ORDER BY revision LIMIT ?",
+                (after, scan_limit + 1))]
+            window = ids[:scan_limit]
+            has_more = len(ids) > scan_limit
+            protected = _protected_revisions(db, window)
+            deleted = tuple(r for r in window if r not in protected)
+            retained = tuple(r for r in window if r in protected)
+            if deleted:
+                placeholders = ",".join("?" for _ in deleted)
+                db.execute("DELETE FROM revision WHERE id IN (%s)" % placeholders, deleted)
+                db.execute("DELETE FROM retired_revision WHERE revision IN (%s)" % placeholders,
+                           deleted)
+            next_after = window[-1] if has_more and window else None
+            return {"deleted": deleted, "retained": retained, "next_after": next_after}
 
     # ------------------------------------------------------------------
     # Configuration groups: atomic multi-component publishing with an
@@ -447,6 +612,59 @@ class Distribution:
             remove = tuple(sorted(old_scope - current_scope))
             return {"epoch": current_epoch, "mode": "delta",
                     "put": put, "remove": remove}
+
+
+def _protected_revisions(db, candidates):
+    """Return the subset of candidate ids still referenced by a live holder.
+
+    Protection is computed from the live tables only, never from a permanent
+    per-deleted-revision tombstone: the full pointer, an active canary, any
+    unreleased pin, and every binding reachable in the retained group window.
+    """
+    if not candidates:
+        return set()
+    placeholders = ",".join("?" for _ in candidates)
+    candidates = tuple(candidates)
+    protected = set()
+
+    # Single full-channel pointer.
+    revision = db.execute("SELECT revision FROM channel WHERE slot=1").fetchone()[0]
+    if revision in candidates:
+        protected.add(revision)
+
+    # The active canary candidate, if any.
+    revision = db.execute("SELECT revision FROM canary").fetchone()
+    if revision is not None and revision[0] in candidates:
+        protected.add(revision[0])
+
+    # Any unreleased pin.
+    protected.update(
+        row[0] for row in db.execute(
+            "SELECT DISTINCT m.revision FROM pin_member m "
+            "JOIN pin p ON p.id = m.pin_id WHERE m.revision IN (%s)" % placeholders,
+            candidates))
+
+    # Every revision bound at any epoch still inside the group window: the
+    # moving baseline (the snapshot at the oldest retained epoch) plus all
+    # retained change events, which cover every epoch up to and including the
+    # current one. Bindings below the window were folded away, so an old
+    # binding is only retained while the group actually still references it.
+    protected.update(
+        row[0] for row in db.execute(
+            "SELECT DISTINCT revision FROM group_base WHERE revision IN (%s)"
+            % placeholders, candidates))
+    protected.update(
+        row[0] for row in db.execute(
+            "SELECT DISTINCT revision FROM group_event "
+            "WHERE revision IN (%s)" % placeholders, candidates))
+    # The live current group is always inside the window; consulting the
+    # single binding table (not a per-epoch expansion) keeps protection correct
+    # even for a database carried over from an earlier build.
+    protected.update(
+        row[0] for row in db.execute(
+            "SELECT DISTINCT revision FROM group_binding "
+            "WHERE revision IN (%s)" % placeholders, candidates))
+    return protected
 
 
 def _load_group_snapshot(db, epoch):

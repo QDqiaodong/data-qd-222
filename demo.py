@@ -18,3 +18,11 @@ with TemporaryDirectory() as root:
     print(subscriber.poll(1))
     publisher.promote(stable, expected_generation=2)
     print(subscriber.poll(2))
+
+    # Retire the now-unused candidate, hold a copy on the duty pin, then collect.
+    pin_id = publisher.pin_revisions((candidate,))
+    publisher.retire_revisions((candidate,))
+    print("retained while pinned:", publisher.collect_retired())
+    print("pin read-back:", publisher.read_pin(pin_id))
+    publisher.unpin_revisions(pin_id)
+    print("collected after release:", publisher.collect_retired())

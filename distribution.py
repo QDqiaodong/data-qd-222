@@ -28,6 +28,14 @@ _MAX_ZONES = 24
 _MAX_RUNTIMES = 10
 _MAX_LOAD = 1_000_000
 _MAX_BUDGET = 24_000_000
+# Declarative device routing. A table names at most 12 device attributes with
+# 2-16 values each and at most 64 rules; rule priorities are 0-255.
+_ROUTE_MIN_AXES = 1
+_ROUTE_MAX_AXES = 12
+_ROUTE_MIN_VALUES = 2
+_ROUTE_MAX_VALUES = 16
+_ROUTE_MAX_RULES = 64
+_ROUTE_MAX_PRIORITY = 255
 # Hot reload: in-memory switchover jobs built from two retained group epochs.
 _HOT_MAX_SLOTS = 128
 _HOT_MAX_BODY_BYTES = 256 * 1024
@@ -170,6 +178,195 @@ def _revision_high_water(db):
     return max(high, top)
 
 
+def _validate_device_axes(axes):
+    """Validate declared device attributes; return name -> sorted value tuple.
+
+    Element order carries no meaning, so values are normalized into a sorted
+    tuple. Rejections are structural ValueErrors, never partial state.
+    """
+    if type(axes) is not dict or not (_ROUTE_MIN_AXES <= len(axes) <= _ROUTE_MAX_AXES):
+        raise ValueError(
+            "axes must be a dict of %d-%d device attributes"
+            % (_ROUTE_MIN_AXES, _ROUTE_MAX_AXES))
+    normalized = {}
+    for name, values in axes.items():
+        if type(name) is not str or _IDENT_RE.fullmatch(name) is None:
+            raise ValueError(
+                "attribute names must be 1-64 ASCII characters of letters, "
+                "digits, '-' or '_'")
+        if type(values) is not tuple or not (
+                _ROUTE_MIN_VALUES <= len(values) <= _ROUTE_MAX_VALUES):
+            raise ValueError(
+                "each attribute must declare a tuple of %d-%d values"
+                % (_ROUTE_MIN_VALUES, _ROUTE_MAX_VALUES))
+        seen = set()
+        for value in values:
+            if type(value) is not str or _IDENT_RE.fullmatch(value) is None:
+                raise ValueError(
+                    "attribute values must be 1-64 ASCII characters of letters, "
+                    "digits, '-' or '_'")
+            if value in seen:
+                raise ValueError(
+                    "attribute %r declares duplicate value %r" % (name, value))
+            seen.add(value)
+        normalized[name] = tuple(sorted(values))
+    return normalized
+
+
+def _validate_device_rules(rules, axes):
+    """Validate routing rules against declared axes; return normalized copies."""
+    if type(rules) is not tuple or not (1 <= len(rules) <= _ROUTE_MAX_RULES):
+        raise ValueError(
+            "rules must be a tuple of 1-%d (priority, match, root) triples"
+            % _ROUTE_MAX_RULES)
+    parsed = []
+    for item in rules:
+        if type(item) is not tuple or len(item) != 3:
+            raise ValueError("each rule must be a (priority, match, root) tuple")
+        priority, match, root = item
+        if type(priority) is not int or not (0 <= priority <= _ROUTE_MAX_PRIORITY):
+            raise ValueError(
+                "rule priorities must be integers in [0, %d]"
+                % _ROUTE_MAX_PRIORITY)
+        if type(root) is not str or _IDENT_RE.fullmatch(root) is None:
+            raise ValueError(
+                "rule roots must be 1-64 ASCII characters of letters, digits, "
+                "'-' or '_'")
+        if type(match) is not dict:
+            raise ValueError("rule match must be a dict keyed by declared attributes")
+        normalized_match = {}
+        for axis, values in match.items():
+            if type(axis) is not str or axis not in axes:
+                raise ValueError("rule match lists an undeclared attribute: %r" % (axis,))
+            if type(values) is not tuple or not values:
+                raise ValueError(
+                    "each matched attribute must list a non-empty tuple of values")
+            allowed = set(axes[axis])
+            seen = set()
+            for value in values:
+                if type(value) is not str or value not in allowed:
+                    raise ValueError(
+                        "rule match for %r lists a value that is not declared" % (axis,))
+                if value in seen:
+                    raise ValueError(
+                        "rule match for %r lists a duplicate value" % (axis,))
+                seen.add(value)
+            normalized_match[axis] = tuple(sorted(values))
+        parsed.append((priority, normalized_match, root))
+    return parsed
+
+
+def _compile_device_rules(axes, parsed_rules):
+    """Order axes by name and express each rule match by axis position."""
+    order = tuple(sorted(axes))
+    values = tuple(axes[name] for name in order)
+    position = {name: index for index, name in enumerate(order)}
+    compiled = []
+    for priority, match, root in parsed_rules:
+        mapped = {position[axis]: frozenset(value_set)
+                  for axis, value_set in match.items()}
+        compiled.append((priority, mapped, root))
+    return order, values, compiled
+
+
+def _route_error(values, rules):
+    """Find the literal smallest portrait that cannot be resolved uniquely.
+
+    Returns None when every portrait has one winning root, else a
+    ``(kind, witness)`` pair where kind is "uncovered" or "ambiguous" and
+    witness is the value tuple ordered by ascending attribute name. The search
+    is symbolic: subtrees whose top-priority rule wins everywhere are pruned
+    with a proof, so the whole Cartesian product is never enumerated.
+    """
+    axis_count = len(values)
+
+    def smallest_suffix(index):
+        return tuple(axis_values[0] for axis_values in values[index:])
+
+    memo = {}
+
+    def solve(index, alive):
+        key = (index, alive)
+        if key in memo:
+            return memo[key]
+        if not alive:
+            # No rule can ever match inside this subtree: every completion is
+            # uncovered, and the smallest one fixes each remaining axis to its
+            # smallest declared value.
+            result = ("uncovered", smallest_suffix(index))
+            memo[key] = result
+            return result
+        priority = max(rules[k][0] for k in alive)
+        top = [k for k in alive if rules[k][0] == priority]
+        roots = {rules[k][2] for k in top}
+        # A top-priority rule with no constraint left to check matches every
+        # completion of this subtree. If every top rule names the same root,
+        # that root wins everywhere here and lower priorities are unreachable,
+        # so this whole subtree is proved clean without descending further.
+        settled = any(
+            not any(position >= index for position in rules[k][1]) for k in top)
+        if len(roots) == 1 and settled:
+            memo[key] = None
+            return None
+        if index == axis_count:
+            result = ("ambiguous", ()) if len(roots) > 1 else None
+            memo[key] = result
+            return result
+        best = None
+        for value in values[index]:
+            narrowed = frozenset(
+                k for k in alive
+                if index not in rules[k][1] or value in rules[k][1][index])
+            suffix = solve(index + 1, narrowed)
+            if suffix is not None:
+                # Values are visited in ascending order, so the first error
+                # completion found is the literal smallest one.
+                best = (suffix[0], (value,) + suffix[1])
+                break
+        memo[key] = best
+        return best
+
+    return solve(0, frozenset(range(len(rules))))
+
+
+def _route_winners(values, rules):
+    """Return the roots that win at least one portrait of a resolvable table."""
+    memo = {}
+
+    def solve(index, alive):
+        if not alive:
+            return frozenset()
+        key = (index, alive)
+        if key in memo:
+            return memo[key]
+        priority = max(rules[k][0] for k in alive)
+        top = [k for k in alive if rules[k][0] == priority]
+        roots = frozenset(rules[k][2] for k in top)
+        # A settled top-priority rule matching every completion proves the
+        # subtree resolvable; with one named root it is the only winner here.
+        settled = any(
+            not any(position >= index for position in rules[k][1]) for k in top)
+        if settled:
+            result = roots if len(roots) == 1 else frozenset()
+            memo[key] = result
+            return result
+        if index == len(values):
+            result = roots if len(roots) == 1 else frozenset()
+            memo[key] = result
+            return result
+        winners = set()
+        for value in values[index]:
+            narrowed = frozenset(
+                k for k in alive
+                if index not in rules[k][1] or value in rules[k][1][index])
+            winners.update(solve(index + 1, narrowed))
+        result = frozenset(winners)
+        memo[key] = result
+        return result
+
+    return solve(0, frozenset(range(len(rules))))
+
+
 class Distribution:
     def __init__(self, path):
         self.path = path
@@ -245,6 +442,15 @@ class Distribution:
                 branch TEXT NOT NULL);""")
             db.execute("INSERT OR IGNORE INTO library_meta VALUES (1, ?)",
                        (secrets.token_hex(16),))
+            # Declarative device routing. The table is whole-replaced in one
+            # transaction; element/authored order is not part of its meaning,
+            # so only the derived winning roots need ever be stored. An
+            # existing database simply opens with no table installed.
+            db.executescript("""CREATE TABLE IF NOT EXISTS device_route (
+                slot INTEGER PRIMARY KEY CHECK (slot=1),
+                axes TEXT NOT NULL,
+                rules TEXT NOT NULL,
+                roots TEXT NOT NULL);""")
 
     def stage(self, config):
         if (type(config) is not dict or set(config) != {"upstream", "timeout_ms"}
@@ -632,6 +838,19 @@ class Distribution:
             if _group_has_cycle(group):
                 raise ValueError("the published group must not contain a dependency cycle")
 
+            # A live declarative routing table must keep every root that can
+            # actually win for some legal device portrait. Roots that only
+            # appear in shadowed rules stay deletable. The stored winners are
+            # derived at install time, so this check never re-expands the
+            # device domain.
+            route_row = db.execute(
+                "SELECT roots FROM device_route WHERE slot=1").fetchone()
+            if route_row is not None:
+                missing = sorted(
+                    root for root in json.loads(route_row[0]) if root not in group)
+                if missing:
+                    raise ValueError("in_use_root", missing[0])
+
             new_epoch = current_epoch + 1
             for name, binding in parsed.items():
                 if binding is None:
@@ -792,6 +1011,96 @@ class Distribution:
             remove = tuple(sorted(old_scope - current_scope))
             return {"epoch": current_epoch, "mode": "delta", "put": put,
                     "remove": remove, "cursor": (branch, current_epoch)}
+
+    # ------------------------------------------------------------------
+    # Declarative device routing. Operators install one routing table over a
+    # fixed Cartesian device domain and devices arrive with only their
+    # attributes. Serving is a read of the same group bindings, so a delivery
+    # always reflects one committed state (never an old root with new content).
+    # ------------------------------------------------------------------
+
+    def install_device_routes(self, axes, rules, *, expected_epoch):
+        # Pure validation and the whole-domain proof happen before any database
+        # access: a shape error or a semantic hole never touches stored state.
+        if type(expected_epoch) is not int:
+            raise ValueError("expected_epoch must be an integer")
+        validated_axes = _validate_device_axes(axes)
+        parsed_rules = _validate_device_rules(rules, validated_axes)
+        order, values, compiled = _compile_device_rules(
+            validated_axes, parsed_rules)
+
+        error = _route_error(values, compiled)
+        if error is not None:
+            raise ValueError(error[0], error[1])
+        winners = _route_winners(values, compiled)
+        with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            current_epoch = db.execute(
+                "SELECT epoch FROM group_meta WHERE slot=1").fetchone()[0]
+            if current_epoch != expected_epoch:
+                raise ConflictingPromotion(expected_epoch)
+
+            # Only roots that actually win somewhere must be present in the
+            # current group; shadowed rules may name unpublished roots. The
+            # group and the table replacement commit together, so an install
+            # racing a removal can never leave a table that selects nothing.
+            group = {row[0]: row[1]
+                     for row in db.execute("SELECT name, revision FROM group_binding")}
+            missing = sorted(root for root in winners if root not in group)
+            if missing:
+                raise ValueError("missing_root", missing[0])
+
+            db.execute(
+                "INSERT INTO device_route(slot, axes, rules, roots) VALUES (1, ?, ?, ?) "
+                "ON CONFLICT(slot) DO UPDATE SET axes=excluded.axes, "
+                "rules=excluded.rules, roots=excluded.roots",
+                (json.dumps({name: list(validated_axes[name]) for name in order},
+                            sort_keys=True),
+                 json.dumps([(priority, {order[position]: sorted(match[position])
+                     for position in match}, root)
+                     for priority, match, root in compiled], sort_keys=True),
+                 json.dumps(sorted(winners), sort_keys=True)))
+            return tuple(sorted(winners))
+
+    def resolve_device_config(self, traits):
+        # Shape validation against the installed table happens under one read
+        # snapshot: the table read, winning-root lookup, group bindings and
+        # config bodies all come from a single committed state.
+        with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
+            db.execute("BEGIN")
+            row = db.execute(
+                "SELECT axes, rules, roots FROM device_route WHERE slot=1").fetchone()
+            if row is None:
+                return None
+            axes_json, rules_json, roots_json = row
+            order = tuple(sorted(json.loads(axes_json)))
+            declared = json.loads(axes_json)
+            if type(traits) is not dict or set(traits) != set(order):
+                raise ValueError(
+                    "traits must be a dict with exactly the declared attributes")
+            for axis in order:
+                value = traits[axis]
+                if type(value) is not str or value not in declared[axis]:
+                    raise ValueError(
+                        "trait %r has a value that is not declared for it" % (axis,))
+            portrait = tuple(traits[axis] for axis in order)
+
+            # Highest priority among rules matching this exact portrait wins.
+            # Installs proved such a root unique for every portrait.
+            best_priority = None
+            winner = None
+            for priority, match, root in json.loads(rules_json):
+                if all(portrait[order.index(axis)] in value_set
+                       for axis, value_set in match.items()):
+                    if best_priority is None or priority > best_priority:
+                        best_priority = priority
+                        winner = root
+            epoch, base_epoch = db.execute(
+                "SELECT epoch, base_epoch FROM group_meta WHERE slot=1").fetchone()
+            group = _load_group_snapshot(db, epoch)
+            scope = _group_scope(group, (winner,))
+            put = _load_configs(db, group, scope)
+            return {"root": winner, "epoch": epoch, "put": put}
 
     # ------------------------------------------------------------------
     # Hot reload: one in-memory job describing how a node can move a set of

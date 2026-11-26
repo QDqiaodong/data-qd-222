@@ -9,6 +9,8 @@ python3 -B -m unittest -v                 # 全部验收（含 test_reclaim.py�
 python3 -B -m unittest -v test_reclaim    # 仅暂存版本回收
 python3 -B -m unittest -v test_recovery_copy  # 仅灾备演练（恢复副本与换库轮询）
 python3 -B -m unittest -v test_hot_reload # 仅边缘节点热切（作业准备、节点验准、值班工单）
+python3 -B -m unittest -v test_device_routes  # 仅设备分流（交付、清理权限、竞争与规模）
+python3 -B -m unittest -v test_device_routes.DeviceRouteTests.test_symbolic_scale
 python3 -B demo.py
 ```
 
@@ -101,6 +103,42 @@ reply = subscriber.poll_group_cursor(("route",), cursor=reply["cursor"])
 - 游标非法（分支不是 32 位小写十六进制、代数为布尔值或超出 0 到 2⁶³−1、形状不对）或根参数非法抛 `ValueError`。旧接口 `poll_group` 的形状与语义不变，仍用裸代数的旧订阅者不受影响；跨库重放写请求或试发令牌不在本协议范围内。
 
 演练规模保证：单库最多 2048 个现存暂存版本、每份配置的序列化正文最多 256 KiB、至多 64 张保留单（每张仍限原来的 32 个版本），组及试发继承现有上限——这些不是给旧接口加的录入限制。复制按页流式进行，恢复进程的峰值内存与库大小无关（验收用例：1024 份约 160 KiB 正文，单独恢复进程从启动至复制完成的峰值 RSS 不超过 96 MiB）。
+
+## 声明式设备分流：按固定属性选入口
+
+现场设备不必知道该订阅哪个组件名，而是上报一组固定属性（板卡系列、接入介质等），由数据库里唯一一张生效分流表选出入口组件。分流表只引用配置组的同名根，正文仍只有一份暂存副本；按名订阅的老设备、单通道与试发都不受影响。所有新表仍以 `CREATE TABLE IF NOT EXISTS` 追加，没有分流表的旧库直接打开即可。
+
+```python
+winners = publisher.install_device_routes(
+    {"board": ("alpha", "beta"), "media": ("fiber", "copper")},
+    ((10, {"board": ("alpha",)}, "main"),
+     (5,  {"board": ("beta",)},  "backup"),
+     (1,  {"board": ("beta",), "media": ("fiber",)}, "cold")),  # 可能被遮住
+    expected_epoch=epoch)
+# -> ('backup', 'main')：实际能胜出的入口（升序）
+reply = device.resolve_device_config({"board": "beta", "media": "copper"})
+# -> {"root": "backup", "epoch": ..., "put": {"backup": (rev, body), ...}}
+```
+
+安装与语义：
+
+- `axes` 是 1–12 个属性的字典，每个属性 2–16 个互不相同、ASCII 合法标识取值；`rules` 是 1–64 条 `(priority, match, root)` 三元组，优先级 0–255（布尔值拒绝）。`match` 只能列声明过的属性，取值须为该属性已声明值组成的非空无重复元组；空字典匹配整个设备域。属性名、取值、入口名沿用配置组的标识语法并区分大小写。输入顺序不改变语义。
+- 合法画像是全部属性的笛卡尔积，不依赖已见设备。安装会用符号化证明（按属性名升序的字典序、按最高优先级剪枝）确认**每个**画像都有唯一获胜入口，而不是抽查；遇到漏洞或冲突时，按属性名升序把画像写成取值元组，报全体出错画像中按字面最小的那个：`ValueError("uncovered", witness)` / `ValueError("ambiguous", witness)`。因此任意大规模域都不会被展开（验收用例：12×16 的 16¹² 个画像在单独子进程限 256 MiB、12 秒内完成三次安装及断言）。
+- 两条规则同为最高优先级且给出同一个入口（含重复规则）不报错；低优先级冲突若永远被更高优先级遮住也不报错。
+- 仅当整张表可判定时，才要求实际能胜出的入口存在于**当前**配置组；永远被遮住的规则可以写尚未发布或已下线的入口。缺失时抛 `ValueError("missing_root", root)`，多项缺失报字面最小名。成功返回所有实际可胜出入口的升序元组。
+- `expected_epoch` 沿用组发布代数比较；代数已变抛 `ConflictingPromotion`，形状非法抛 `ValueError`。对组代数与入口存续的检查与整张表的替换在同一个 `BEGIN IMMEDIATE` 事务里提交：一处失败不会改动旧分流表或组内容。成功不推进组代数、不新增组历史；重开库后继续使用已提交的表。
+
+交付：
+
+- `resolve_device_config(traits)` 在未安装表时返回 `None`；否则 `traits` 必须是恰好含全部声明属性、每项取值合法的字典，不合法抛 `ValueError`。
+- 返回 `{"root": root, "epoch": epoch, "put": put}`；`put` 就是在该组代数下对这个单根首次 `poll_group` 会拿到的各组件 `(revision, config)`，含完整传递依赖，不含其他入口的私有组件。表读取、获胜根、组绑定与正文都取自同一个只读快照，因此不会把旧表选出的根拼上新组内容，也不需要设备保留上一份根名或报告安装进度。
+
+约束实际组变更：
+
+- 普通 `publish_group` 仍校验整批现有依赖约束；此外，若提交后的组将缺少任一当前分流表的可胜出入口，则拒绝并以 `ValueError("in_use_root", root)`（字面最小受影响入口）报出。拒绝不推进代数、不留组历史。只被提到而无法被任何设备选中的入口仍可照常删除；对仍绑定名字的入口正常更换版本或依赖不会被分流拦住，设备下一次取配置得到变更后的完整范围。
+- 分流替换、组发布与设备读各自都发生在一个已提交状态上：一次安装与一次清理不会各自成功却在库里留下能选到空入口的表（验收用例用两个独立连接、同步起跑点竞争验证至多一方成功，并检查最终的代数与实际正文）。
+
+灾备副本若源库已启用分流，打开副本后 `resolve_device_config` 返回副本对应时点的表与组；在途试发照旧不带入副本。
 
 ## 边缘节点热切：作业准备、节点验准与值班工单
 
